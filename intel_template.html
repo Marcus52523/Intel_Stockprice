@@ -38,6 +38,29 @@ svg { display: block; width: 100%; height: 360px; touch-action: none; }
   padding: 6px 8px; border-radius: 6px; white-space: nowrap; transform: translate(-50%, -100%); }
 .tip b { font-weight: 500; font-size: 14px; display: block; }
 footer { font-size: 12px; color: var(--muted); }
+.main { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 16px; align-items: start; }
+.bill { background: var(--surface); border-radius: 12px; padding: 16px; display: grid; gap: 12px; min-width: 0; }
+.bill h2 { margin: 0; font: 500 12px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.drop { border: 1.5px dashed var(--grid); border-radius: 10px; padding: 18px 12px; text-align: center; cursor: pointer;
+  color: var(--muted); font-size: 13px; line-height: 1.4; }
+.drop:hover, .drop.over { border-color: var(--line); color: var(--fg); }
+.drop:focus-within { outline: 2px solid var(--line); outline-offset: 2px; }
+.drop strong { color: var(--line); font-weight: 600; }
+.drop input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.status { font-size: 13px; color: var(--muted); }
+.status.err { color: var(--down); }
+.sum { font: 500 30px/1.1 var(--mono); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.sum small { font-size: 15px; color: var(--muted); margin-left: 3px; }
+.meta { font-size: 12px; color: var(--muted); display: grid; gap: 6px; overflow-wrap: anywhere; }
+.meta code { font: 11px var(--mono); background: var(--bg); padding: 2px 4px; border-radius: 4px; }
+.shares { font-size: 13px; }
+.shares b { font-family: var(--mono); font-weight: 500; }
+.fix { display: flex; gap: 6px; align-items: center; font-size: 12px; color: var(--muted); }
+.fix input { width: 100%; min-width: 0; font: 13px var(--mono); padding: 5px 7px; border: 1px solid var(--grid);
+  border-radius: 6px; background: var(--bg); color: var(--fg); }
+.fix input:focus-visible { outline: 2px solid var(--line); outline-offset: 0; }
+.note { font-size: 11px; color: var(--muted); margin: 0; }
+@media (max-width: 760px) { .main { grid-template-columns: 1fr; } }
 @media (max-width: 480px) { .price { font-size: 32px; } svg { height: 280px; } }
 </style>
 
@@ -56,9 +79,28 @@ footer { font-size: 12px; color: var(--muted); }
       <button id="r5y" data-d="99999">5Y</button>
     </div>
   </header>
-  <div class="chart">
-    <svg id="svg" role="img" aria-label="Line chart of the Intel share price in euros"></svg>
-    <div class="tip" id="tip" hidden></div>
+  <div class="main">
+    <div class="chart">
+      <svg id="svg" role="img" aria-label="Line chart of the Intel share price in euros"></svg>
+      <div class="tip" id="tip" hidden></div>
+    </div>
+    <aside class="bill" aria-labelledby="billTitle">
+      <h2 id="billTitle">Bill total</h2>
+      <label class="drop" id="drop">
+        <input type="file" id="billFile" accept="application/pdf,.pdf">
+        <strong>Upload a PDF bill</strong><br>or drop it here
+      </label>
+      <div class="status" id="billStatus" aria-live="polite">No bill yet. Scanned and digital PDFs both work.</div>
+      <div id="billResult" hidden>
+        <div class="sum" id="billSum"></div>
+        <div class="shares" id="billShares"></div>
+        <div class="meta" id="billMeta"></div>
+        <label class="fix" for="billFix">Correct:
+          <input type="text" id="billFix" inputmode="decimal" autocomplete="off">
+        </label>
+      </div>
+      <p class="note">The PDF is read in your browser and is never uploaded.</p>
+    </aside>
   </div>
   <footer id="foot"></footer>
 </div>
@@ -150,6 +192,145 @@ function draw() {
   hit.addEventListener("pointerdown", move);
   hit.addEventListener("pointerleave", leave);
 }
+
+/* ---------- Bill upload: read PDF text (OCR for scans) and find the total ---------- */
+const PDFJS = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/";
+const TESSERACT = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js";
+const MAX_OCR_PAGES = 3;
+const $ = id => document.getElementById(id);
+
+function loadScript(src) {
+  return new Promise((ok, fail) => {
+    if (document.querySelector(`script[src="${src}"]`)) return ok();
+    const s = document.createElement("script");
+    s.src = src; s.onload = ok; s.onerror = () => fail(new Error("Could not load " + src));
+    document.head.appendChild(s);
+  });
+}
+
+// Amounts like 1.234,56 / 1,234.56 / 12,50 / 99.90 — not dates (09.10.2026) or percentages
+const AMOUNT = /(?<![\d.,])(\d{1,3}(?:[.,' ]\d{3})+|\d+)[.,](\d{2})(?![.,]?\d)(?!\s*%)/g;
+const STRONG = /(gesamtbetrag|rechnungsbetrag|endbetrag|zahlbetrag|zu zahlen|gesamtsumme|bruttobetrag|summe brutto|gesamt brutto|total due|amount due|balance due|grand total)/i;
+const MEDIUM = /(gesamt|summe|total|betrag|brutto)/i;
+const WEAK = /(netto|zwischensumme|subtotal|mwst|ust\b|steuer|tax|rabatt|discount)/i;
+
+function amountsIn(line) {
+  return [...line.matchAll(AMOUNT)].map(m => +(m[1].replace(/[.,' ]/g, "") + "." + m[2]));
+}
+
+function findTotal(text) {
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  let best = null;
+  lines.forEach((line, i) => {
+    const strong = STRONG.test(line);
+    let score = strong ? 3 : MEDIUM.test(line) ? 2 : 0;
+    if (!score) return;
+    if (!strong && WEAK.test(line)) score = 1;
+    // OCR often puts the amount on the line after the label
+    let nums = amountsIn(line), src = line;
+    if (!nums.length && lines[i + 1]) { nums = amountsIn(lines[i + 1]); src = line + " " + lines[i + 1]; }
+    for (const v of nums) {
+      if (!best || score > best.score || (score === best.score && v > best.value)) best = { value: v, line: src, score };
+    }
+  });
+  if (best) return best;
+  const all = lines.flatMap(l => amountsIn(l).map(v => ({ value: v, line: l, score: 0 })));
+  return all.sort((a, b) => b.value - a.value)[0] || null;
+}
+
+async function readPdf(file, status) {
+  await loadScript(PDFJS + "pdf.min.js");
+  pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS + "pdf.worker.min.js";
+  const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+
+  status("Reading text…");
+  let text = "";
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const tc = await (await pdf.getPage(p)).getTextContent();
+    text += tc.items.map(it => it.str + (it.hasEOL ? "\n" : " ")).join("") + "\n";
+  }
+  if (text.replace(/\s/g, "").length > 30) return { text, ocr: false };
+
+  // No text layer, so it's a scan: render pages and run OCR
+  status("Scanned PDF, loading text recognition…");
+  await loadScript(TESSERACT);
+  const pages = Math.min(pdf.numPages, MAX_OCR_PAGES);
+  let page = 1;
+  const worker = await Tesseract.createWorker("deu+eng", 1, {
+    logger: m => { if (m.status === "recognizing text") status(`Recognizing text, page ${page}/${pages}… ${Math.round(m.progress * 100)}%`); }
+  });
+  try {
+    for (; page <= pages; page++) {
+      const pg = await pdf.getPage(page), vp = pg.getViewport({ scale: 2 });
+      const canvas = document.createElement("canvas");
+      canvas.width = vp.width; canvas.height = vp.height;
+      await pg.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+      text += (await worker.recognize(canvas)).data.text + "\n";
+    }
+  } finally { await worker.terminate(); }
+  return { text, ocr: true };
+}
+
+function showBill(bill) {
+  $("billResult").hidden = false;
+  $("billSum").innerHTML = `${eur(bill.value)}<small>€</small>`;
+  const price = ALL[ALL.length - 1].v;
+  $("billShares").innerHTML = `≈ <b>${(bill.value / price).toLocaleString("de-DE", { maximumFractionDigits: 2 })}</b> Intel shares at ${eur(price)} €`;
+  $("billMeta").innerHTML = "";
+  const add = (label, val) => {
+    const d = document.createElement("div");
+    d.textContent = label + " ";
+    if (val) { const c = document.createElement("code"); c.textContent = val; d.appendChild(c); }
+    $("billMeta").appendChild(d);
+  };
+  add(bill.name);
+  if (bill.edited) add("Corrected by hand");
+  else if (bill.line) add(bill.score ? "Found in:" : "No total label found, largest amount:", bill.line.slice(0, 120));
+  $("billFix").value = bill.value.toFixed(2).replace(".", ",");
+  try { localStorage.setItem("intc-bill", JSON.stringify(bill)); } catch (e) {}
+}
+
+async function handleFile(file) {
+  if (!file) return;
+  const st = $("billStatus");
+  const status = msg => { st.className = "status"; st.textContent = msg; };
+  if (!/\.pdf$/i.test(file.name) && file.type !== "application/pdf") {
+    st.className = "status err"; st.textContent = "That isn't a PDF. Choose a .pdf file."; return;
+  }
+  status("Opening PDF…");
+  try {
+    const { text, ocr } = await readPdf(file, status);
+    const total = findTotal(text);
+    if (!total) {
+      st.className = "status err";
+      st.textContent = "No amount found in this PDF. Type the total into the box below.";
+      showBill({ name: file.name, value: 0, line: "", score: 0, edited: true });
+      return;
+    }
+    status(ocr ? "Done. Read from the scan, so check the amount." : "Done.");
+    showBill({ name: file.name, ...total, edited: false });
+  } catch (err) {
+    st.className = "status err";
+    st.textContent = "Couldn't read this PDF (" + err.message + "). Try another file.";
+  }
+}
+
+$("billFile").addEventListener("change", e => handleFile(e.target.files[0]));
+const drop = $("drop");
+drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
+drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+drop.addEventListener("drop", e => { e.preventDefault(); drop.classList.remove("over"); handleFile(e.dataTransfer.files[0]); });
+$("billFix").addEventListener("change", e => {
+  const v = amountsIn(e.target.value.trim() + (/[.,]\d{2}$/.test(e.target.value.trim()) ? "" : ",00"))[0];
+  if (v === undefined) return;
+  let bill = {};
+  try { bill = JSON.parse(localStorage.getItem("intc-bill")) || {}; } catch (err) {}
+  showBill({ name: bill.name || "Manual entry", value: v, line: "", score: 0, edited: true });
+});
+try {
+  const saved = JSON.parse(localStorage.getItem("intc-bill"));
+  if (saved) { showBill(saved); $("billStatus").textContent = "Last bill you uploaded on this device."; }
+} catch (e) {}
 
 document.getElementById("ranges").addEventListener("click", e => {
   const b = e.target.closest("button"); if (!b) return;
